@@ -1,35 +1,232 @@
-import os
-from dotenv import load_dotenv
+import json
+import sqlite3
 
-# .envファイルから環境変数をロード
-# これにより、OSの環境変数にアクセスするのと同じように、.envファイルに定義された変数にアクセスできるようになる
-load_dotenv()
 
-# Brave Search APIキーの取得
-# 環境変数 'BRAVE_SEARCH_API_KEY' が設定されていない場合、Noneを返す
-BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
+class CacheManager:
+    """
+    アプリケーションのキャッシュ管理を担当するクラス。
+    SQLiteデータベースを使用して、質問、検索結果、Webページコンテンツ、回答を保存・取得する。
+    """
+    def __init__(self, db_path):
+        """
+        CacheManagerを初期化します。
+        データベースファイルが存在しない場合は作成し、テーブルを初期化します。
 
-# キャッシュデータベースのパス
-# プロジェクトルートのdataディレクトリ内にqa_cache.dbとして保存
-CACHE_DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'qa_cache.db')
+        Args:
+            db_path (str): SQLiteデータベースファイルのパス。
+        """
+        self.db_path = db_path
+        self._initialize_db()
 
-# Hugging Faceモデルのキャッシュディレクトリ
-# プロジェクトルートのmodelsディレクトリ内に保存
-HF_MODEL_CACHE_DIR = os.path.join(os.path.dirname(__file__), 'models')
+    def _initialize_db(self):
+        """
+        データベースを初期化し、必要なテーブルを作成します。
+        テーブルが存在しない場合のみ作成されます。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
 
-# Brave Search APIの基本URL
-BRAVE_API_BASE_URL = "https://api.search.brave.com/res/v1/web/search"
+            # 'queries' テーブル: ユーザーの質問と関連するメタデータを保存
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question TEXT UNIQUE NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ''')
 
-# Webページ取得時のタイムアウト秒数
-WEB_REQUEST_TIMEOUT = 10
+            # 'search_results' テーブル: Brave Search APIからの検索結果を保存
+            # result_dataはJSON形式で保存
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS search_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query_id INTEGER NOT NULL,
+                    brave_response_json TEXT NOT NULL,
+                    FOREIGN KEY (query_id) REFERENCES queries(id)
+                );
+            ''')
 
-# Q&Aモデルの指定
-# distilbert-base-cased-distilled-squad は比較的小さく、CPUでも動作しやすい
-QA_MODEL_NAME = "distilbert-base-cased-distilled-squad"
+            # 'web_contents' テーブル: 取得したWebページの本文コンテンツを保存
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS web_contents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ''')
 
-# 検索結果からコンテンツを取得する最大URL数
-# クエリ制限を考慮し、少なめに設定
-MAX_CONTENT_URLS_TO_FETCH = 3
+            # 'answers' テーブル: 抽出された回答と、それが関連するクエリ、WebコンテンツのURLを保存
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS answers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query_id INTEGER NOT NULL,
+                    answer_text TEXT NOT NULL,
+                    source_url TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (query_id) REFERENCES queries(id)
+                );
+            ''')
 
-# Q&Aモデルに渡す関連性の高い段落の最大数
-MAX_PARAGRAPHS_FOR_QA = 5
+            conn.commit()
+            print(f"Database initialized or already exists at: {self.db_path}")
+
+        except sqlite3.Error as e:
+            print(f"Database initialization error: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_cached_answer(self, question):
+        """
+        指定された質問に対するキャッシュされた回答を取得します。
+
+        Args:
+            question (str): ユーザーからの質問。
+
+        Returns:
+            tuple or None: (answer_text, source_url) のタプル、またはキャッシュがない場合はNone。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT a.answer_text, a.source_url
+                FROM answers a
+                JOIN queries q ON a.query_id = q.id
+                WHERE q.question = ?
+                ORDER BY a.timestamp DESC
+                LIMIT 1;
+            ''', (question,))
+            result = cursor.fetchone()
+            return result
+        except sqlite3.Error as e:
+            print(f"Error getting cached answer: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def cache_qa_data(self, question, brave_response_json, web_contents_data, answer_text, source_url):
+        """
+        質問、Brave Searchの結果、Webページコンテンツ、抽出された回答をキャッシュします。
+
+        Args:
+            question (str): ユーザーからの質問。
+            brave_response_json (dict): Brave Search APIからの生JSONレスポンス。
+            web_contents_data (list): [(url, content), ...] 形式のWebページコンテンツのリスト。
+            answer_text (str): 抽出された回答テキスト。
+            source_url (str): 回答の出典元のURL。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # 1. 'queries' テーブルに質問を挿入（または既存IDを取得）
+            cursor.execute('INSERT OR IGNORE INTO queries (question) VALUES (?)', (question,))
+            cursor.execute('SELECT id FROM queries WHERE question = ?', (question,))
+            query_id = cursor.fetchone()[0]
+
+            # 2. 'search_results' テーブルにBrave Searchの生レスポンスを挿入
+            cursor.execute('''
+                INSERT INTO search_results (query_id, brave_response_json)
+                VALUES (?, ?)
+            ''', (query_id, json.dumps(brave_response_json)))
+
+            # 3. 'web_contents' テーブルにWebページコンテンツを挿入
+            for url, content in web_contents_data:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO web_contents (url, content)
+                    VALUES (?, ?)
+                ''', (url, content))
+
+            # 4. 'answers' テーブルに回答を挿入
+            cursor.execute('''
+                INSERT INTO answers (query_id, answer_text, source_url)
+                VALUES (?, ?, ?)
+            ''', (query_id, answer_text, source_url))
+
+            conn.commit()
+            print("QA data successfully cached.")
+
+        except sqlite3.Error as e:
+            print(f"Error caching QA data: {e}")
+            # エラー発生時はロールバック
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+
+    def get_cached_brave_response(self, question):
+        """
+        指定された質問に対するキャッシュされたBrave Searchの生レスポンスを取得します。
+
+        Args:
+            question (str): ユーザーからの質問。
+
+        Returns:
+            dict or None: Brave Searchの生JSONレスポンス辞書、またはキャッシュがない場合はNone。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT sr.brave_response_json
+                FROM search_results sr
+                JOIN queries q ON sr.query_id = q.id
+                WHERE q.question = ?
+                ORDER BY sr.id DESC
+                LIMIT 1;
+            ''', (question,))
+            result = cursor.fetchone()
+            if result:
+                return json.loads(result[0])
+            return None
+        except sqlite3.Error as e:
+            print(f"Error getting cached Brave response: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def get_cached_web_contents(self, urls):
+        """
+        指定されたURLリストに対するキャッシュされたWebコンテンツを取得します。
+
+        Args:
+            urls (list): 取得したいWebコンテンツのURLリスト。
+
+        Returns:
+            dict: {url: content} の形式で、キャッシュされたコンテンツを返します。
+                  キャッシュされていないURLは含まれません。
+        """
+        conn = None
+        cached_contents = {}
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            for url in urls:
+                cursor.execute('SELECT content FROM web_contents WHERE url = ?', (url,))
+                result = cursor.fetchone()
+                if result:
+                    cached_contents[url] = result[0]
+            return cached_contents
+        except sqlite3.Error as e:
+            print(f"Error getting cached web contents: {e}")
+            return {}
+        finally:
+            if conn:
+                conn.close()
+
+"""
+モジュールがインポートされたときにデータベースを初期化
+これはmain.pyでCacheManagerをインスタンス化する際に自動的に行われる
+または、config.pyのCACHE_DB_PATHを使って直接初期化を呼び出すことも可能
+例: cache_manager_instance = CacheManager(config.CACHE_DB_PATH)
+"""
